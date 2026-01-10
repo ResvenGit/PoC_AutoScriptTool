@@ -7,7 +7,7 @@ import time
 import warnings
 from functools import partial
 from pathlib import Path
-from typing import Callable, List
+from typing import Any, Callable, List
 
 warnings.filterwarnings(
     "ignore",
@@ -15,11 +15,21 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-from PySide6.QtGui import QDoubleValidator, QIntValidator, QResizeEvent
-from PySide6.QtCore import QEvent, QTimer, QUrl, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QDoubleValidator,
+    QFont,
+    QFontMetrics,
+    QIntValidator,
+    QPainter,
+    QPen,
+    QResizeEvent,
+)
+from PySide6.QtCore import QEvent, QTimer, QUrl, Qt, QRect, Signal
 
 from PySide6.QtWidgets import (
     QApplication,
+    QColorDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -35,11 +45,13 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QAbstractItemView,
+    QFontComboBox,
+    QCheckBox,
     QHeaderView,
     QSizePolicy,
+    QSpinBox,
 )
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoFrame, QVideoSink
 
 from config import SubtitleConfig, load_config, save_config
 from asr import transcribe
@@ -72,6 +84,7 @@ def build_cue_entry(
     source_end: float,
     text: str,
     offset: float = 0.0,
+    overlay_meta: dict[str, Any] | None = None,
 ) -> dict:
     """Creates a cue entry storing both source timing and adjusted labels."""
     source_start = max(0.0, source_start)
@@ -79,7 +92,7 @@ def build_cue_entry(
     adjusted_start = max(0.0, source_start - offset)
     adjusted_end = max(adjusted_start, source_end - offset)
     duration = max(0.0, adjusted_end - adjusted_start)
-    return {
+    entry = {
         "source_start": source_start,
         "source_end": source_end,
         "start_seconds": adjusted_start,
@@ -90,6 +103,14 @@ def build_cue_entry(
         "text": text,
         "char_count": len(text),
     }
+    if overlay_meta:
+        overlay_updates = {
+            key: overlay_meta[key]
+            for key in OVERLAY_METADATA_KEYS
+            if key in overlay_meta
+        }
+        entry.update(overlay_updates)
+    return entry
 
 
 def split_segments(
@@ -140,6 +161,376 @@ def split_segments(
     return split_result
 
 
+DEFAULT_FONT_FAMILY = "Malgun Gothic"
+DEFAULT_FONT_SIZE = 32
+DEFAULT_FONT_COLOR = "#FFFFFF"
+DEFAULT_OUTLINE_ENABLED = True
+DEFAULT_OUTLINE_THICKNESS = 3
+DEFAULT_OUTLINE_COLOR = "#000000"
+DEFAULT_OVERLAY_MARGIN = 16
+DEFAULT_OVERLAY_HEIGHT = 80
+OVERLAY_METADATA_KEYS = [
+    "font_family",
+    "font_size",
+    "font_color",
+    "outline_enabled",
+    "outline_thickness",
+    "outline_color",
+    "overlay_rect",
+    "overlay_space",
+    "show_overlay_box",
+    "mute_preview",
+]
+
+
+def _rect_to_dict(rect: QRect) -> dict:
+    return {"x": rect.x(), "y": rect.y(), "width": rect.width(), "height": rect.height()}
+
+
+def _dict_to_rect(data: dict[str, int], bounds: QRect) -> QRect:
+    x = int(data.get("x", DEFAULT_OVERLAY_MARGIN))
+    y = int(data.get("y", bounds.height() - DEFAULT_OVERLAY_HEIGHT - DEFAULT_OVERLAY_MARGIN))
+    width = int(data.get("width", max(100, bounds.width() - DEFAULT_OVERLAY_MARGIN * 2)))
+    height = int(data.get("height", DEFAULT_OVERLAY_HEIGHT))
+    rect = QRect(x, y, width, height)
+    return rect.intersected(bounds)
+
+
+class VideoPreviewWidget(QWidget):
+    clicked = Signal()
+    rectAdjusted = Signal(QRect)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._sink: QVideoSink | None = None
+        self._frame_image = None
+        self._video_size = None
+        self._video_target_rect = QRect()
+        self._compositing_enabled = False
+        self._subtitle_text = ""
+        self._subtitle_style: dict[str, Any] = {
+            "font_family": DEFAULT_FONT_FAMILY,
+            "font_size": DEFAULT_FONT_SIZE,
+            "font_color": DEFAULT_FONT_COLOR,
+            "outline_enabled": DEFAULT_OUTLINE_ENABLED,
+            "outline_thickness": DEFAULT_OUTLINE_THICKNESS,
+            "outline_color": DEFAULT_OUTLINE_COLOR,
+        }
+        self._subtitle_rect_video: QRect | None = None
+        self._wrap_cache_key = None
+        self._wrap_cache_lines: list[str] | None = None
+
+    def set_video_sink(self, sink: QVideoSink) -> None:
+        if self._sink is not None:
+            try:
+                self._sink.videoFrameChanged.disconnect(self._on_video_frame_changed)
+            except (TypeError, RuntimeError):
+                pass
+        self._sink = sink
+        sink.videoFrameChanged.connect(self._on_video_frame_changed)
+
+    def video_size(self):
+        return self._video_size
+
+    def video_target_rect(self) -> QRect:
+        self._video_target_rect = self._compute_video_target_rect()
+        return QRect(self._video_target_rect)
+
+    def _compute_video_target_rect(self) -> QRect:
+        if self._video_size is None:
+            return QRect()
+        video_w = self._video_size.width()
+        video_h = self._video_size.height()
+        if video_w <= 0 or video_h <= 0:
+            return QRect()
+        widget_w = max(1, self.width())
+        widget_h = max(1, self.height())
+        scale = min(widget_w / video_w, widget_h / video_h)
+        target_w = max(1, int(round(video_w * scale)))
+        target_h = max(1, int(round(video_h * scale)))
+        x = (widget_w - target_w) // 2
+        y = (widget_h - target_h) // 2
+        return QRect(x, y, target_w, target_h)
+
+    def map_video_rect_to_widget(self, rect: QRect) -> QRect | None:
+        if self._video_size is None:
+            return None
+        target = self.video_target_rect()
+        if target.isEmpty():
+            return None
+        video_w = self._video_size.width()
+        video_h = self._video_size.height()
+        if video_w <= 0 or video_h <= 0:
+            return None
+        sx = target.width() / video_w
+        sy = target.height() / video_h
+        x = target.x() + rect.x() * sx
+        y = target.y() + rect.y() * sy
+        w = rect.width() * sx
+        h = rect.height() * sy
+        return QRect(int(round(x)), int(round(y)), int(round(w)), int(round(h)))
+
+    def map_widget_rect_to_video(self, rect: QRect) -> QRect | None:
+        if self._video_size is None:
+            return None
+        target = self.video_target_rect()
+        if target.isEmpty():
+            return None
+        video_w = self._video_size.width()
+        video_h = self._video_size.height()
+        if video_w <= 0 or video_h <= 0:
+            return None
+        sx = target.width() / video_w
+        sy = target.height() / video_h
+        if sx == 0 or sy == 0:
+            return None
+        x = (rect.x() - target.x()) / sx
+        y = (rect.y() - target.y()) / sy
+        w = rect.width() / sx
+        h = rect.height() / sy
+        return QRect(int(round(x)), int(round(y)), int(round(w)), int(round(h)))
+
+    def enable_compositing(self, enabled: bool) -> None:
+        self._compositing_enabled = enabled
+        self.update()
+
+    def set_subtitle(self, text: str, style: dict[str, Any], rect_video: QRect | None) -> None:
+        self._subtitle_text = text or ""
+        self._subtitle_style = dict(style or {})
+        self._subtitle_rect_video = QRect(rect_video) if rect_video is not None else None
+        self.update()
+
+    def clear_subtitle(self) -> None:
+        self._subtitle_text = ""
+        self._subtitle_rect_video = None
+        self.update()
+
+    def _on_video_frame_changed(self, frame: QVideoFrame) -> None:
+        try:
+            self._frame_image = frame.toImage()
+        except Exception:
+            self._frame_image = None
+        if self._frame_image is not None and not self._frame_image.isNull():
+            self._video_size = self._frame_image.size()
+        self.update()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        return super().mousePressEvent(event)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        try:
+            painter.setRenderHints(
+                QPainter.Antialiasing
+                | QPainter.TextAntialiasing
+                | QPainter.SmoothPixmapTransform
+            )
+            painter.fillRect(self.rect(), QColor(0, 0, 0))
+
+            self._video_target_rect = self._compute_video_target_rect()
+            if self._frame_image is not None and not self._frame_image.isNull():
+                image = self._frame_image
+                scaled = image.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                x = (self.width() - scaled.width()) // 2
+                y = (self.height() - scaled.height()) // 2
+                self._video_target_rect = QRect(x, y, scaled.width(), scaled.height())
+                painter.drawImage(x, y, scaled)
+
+            if not self._compositing_enabled:
+                return
+            if not self._subtitle_text or self._subtitle_rect_video is None:
+                return
+
+            rect = self.map_video_rect_to_widget(self._subtitle_rect_video)
+            if rect is None:
+                return
+            target = self._video_target_rect if not self._video_target_rect.isEmpty() else self.rect()
+            rect = rect.intersected(target)
+            if rect.isEmpty():
+                return
+
+            adjusted = self._expand_rect_upwards_to_fit(rect, target, self._subtitle_text, self._subtitle_style)
+            if adjusted != rect:
+                adjusted_video = self.map_widget_rect_to_video(adjusted)
+                if adjusted_video is not None:
+                    self.rectAdjusted.emit(adjusted_video)
+                rect = adjusted
+
+            self._draw_subtitle(painter, rect, self._subtitle_text, self._subtitle_style)
+        finally:
+            if painter.isActive():
+                painter.end()
+
+    def _expand_rect_upwards_to_fit(
+        self,
+        rect: QRect,
+        bounds: QRect,
+        text: str,
+        style: dict[str, Any],
+    ) -> QRect:
+        padding = 8
+        available_width = max(20, rect.width() - padding * 2)
+        scale = 1.0
+        if self._video_size is not None and not self._video_target_rect.isEmpty():
+            video_w = self._video_size.width()
+            if video_w > 0:
+                scale = self._video_target_rect.width() / video_w
+        font_size = int(style.get("font_size") or DEFAULT_FONT_SIZE)
+        font = QFont(
+            style.get("font_family") or DEFAULT_FONT_FAMILY,
+            max(1, int(round(max(8, font_size) * scale))),
+        )
+        metrics = QFontMetrics(font)
+        lines = self._wrap_lines_balanced(text, font, metrics, available_width)
+        needed_height = len(lines) * metrics.lineSpacing() + padding * 2
+        if needed_height <= rect.height():
+            return rect
+        y2 = rect.y() + rect.height()
+        new_y1 = max(bounds.top(), y2 - needed_height)
+        expanded = QRect(rect.x(), new_y1, rect.width(), y2 - new_y1)
+        return expanded.intersected(bounds)
+
+    def _wrap_lines_balanced(
+        self,
+        text: str,
+        font: QFont,
+        metrics: QFontMetrics,
+        max_width: int,
+    ) -> list[str]:
+        cache_key = (
+            text,
+            font.family(),
+            int(font.pointSize()),
+            int(font.pixelSize()),
+            int(font.weight()),
+            bool(font.italic()),
+            int(max_width),
+        )
+        if cache_key == self._wrap_cache_key and self._wrap_cache_lines is not None:
+            return self._wrap_cache_lines
+
+        paragraphs = text.splitlines() or [text]
+        lines: list[str] = []
+        for paragraph in paragraphs:
+            paragraph = paragraph.strip()
+            if not paragraph:
+                lines.append("")
+                continue
+            if " " in paragraph:
+                tokens = paragraph.split()
+                space_width = metrics.horizontalAdvance(" ")
+                token_widths = [metrics.horizontalAdvance(token) for token in tokens]
+                if any(width > max_width for width in token_widths):
+                    lines.extend(self._wrap_by_chars(paragraph, metrics, max_width))
+                    continue
+                breaks = self._optimal_breaks(token_widths, space_width, max_width)
+                idx = 0
+                for next_idx in breaks:
+                    lines.append(" ".join(tokens[idx:next_idx]))
+                    idx = next_idx
+                continue
+
+            lines.extend(self._wrap_by_chars(paragraph, metrics, max_width))
+
+        self._wrap_cache_key = cache_key
+        self._wrap_cache_lines = lines
+        return lines
+
+    def _wrap_by_chars(self, text: str, metrics: QFontMetrics, max_width: int) -> list[str]:
+        chars = list(text)
+        char_widths = [metrics.horizontalAdvance(ch) for ch in chars]
+        breaks = self._optimal_breaks(char_widths, 0, max_width)
+        lines: list[str] = []
+        idx = 0
+        for next_idx in breaks:
+            lines.append("".join(chars[idx:next_idx]))
+            idx = next_idx
+        return lines
+
+    def _optimal_breaks(self, token_widths: list[int], space_width: int, max_width: int) -> list[int]:
+        n = len(token_widths)
+        if n == 0:
+            return [0]
+        inf = 10**18
+        dp = [inf] * (n + 1)
+        nxt = [0] * (n + 1)
+        dp[n] = 0
+        for i in range(n - 1, -1, -1):
+            line_w = 0
+            for j in range(i, n):
+                if j == i:
+                    line_w = token_widths[j]
+                else:
+                    line_w += space_width + token_widths[j]
+                if line_w > max_width and j > i:
+                    break
+                if line_w > max_width and j == i:
+                    continue
+                slack = max_width - line_w
+                cost = slack * slack
+                if j == n - 1:
+                    cost = 0
+                candidate = cost + dp[j + 1]
+                if candidate < dp[i]:
+                    dp[i] = candidate
+                    nxt[i] = j + 1
+        breaks: list[int] = []
+        idx = 0
+        while idx < n:
+            next_idx = nxt[idx]
+            if next_idx <= idx:
+                next_idx = min(n, idx + 1)
+            breaks.append(next_idx)
+            idx = next_idx
+        return breaks
+
+    def _draw_subtitle(self, painter: QPainter, rect: QRect, text: str, style: dict[str, Any]) -> None:
+        padding = 8
+        font_family = style.get("font_family") or DEFAULT_FONT_FAMILY
+        scale = 1.0
+        if self._video_size is not None and not self._video_target_rect.isEmpty():
+            video_w = self._video_size.width()
+            if video_w > 0:
+                scale = self._video_target_rect.width() / video_w
+        font_size = int(style.get("font_size") or DEFAULT_FONT_SIZE)
+        font = QFont(font_family, max(1, int(round(max(8, font_size) * scale))))
+        painter.setFont(font)
+
+        text_rect = rect.adjusted(padding, padding, -padding, -padding)
+        metrics = QFontMetrics(font)
+        max_width = max(20, text_rect.width())
+        lines = self._wrap_lines_balanced(text, font, metrics, max_width)
+        line_spacing = metrics.lineSpacing()
+        baseline_last = text_rect.bottom() - metrics.descent()
+        baseline_first = baseline_last - (len(lines) - 1) * line_spacing
+
+        font_color = QColor(style.get("font_color") or DEFAULT_FONT_COLOR)
+        outline_enabled = bool(style.get("outline_enabled", DEFAULT_OUTLINE_ENABLED))
+        outline_thickness = int(style.get("outline_thickness") or DEFAULT_OUTLINE_THICKNESS)
+        outline_thickness = max(0, int(round(outline_thickness * scale)))
+        outline_color = QColor(style.get("outline_color") or DEFAULT_OUTLINE_COLOR)
+
+        for idx, line in enumerate(lines):
+            baseline = int(round(baseline_first + idx * line_spacing))
+            if baseline < text_rect.top():
+                continue
+            line_width = metrics.horizontalAdvance(line)
+            x = int(round(text_rect.x() + (text_rect.width() - line_width) / 2))
+            if outline_enabled and outline_thickness > 0 and line:
+                outline_pen = QPen(outline_color)
+                painter.setPen(outline_pen)
+                for dx in range(-outline_thickness, outline_thickness + 1):
+                    for dy in range(-outline_thickness, outline_thickness + 1):
+                        if dx == 0 and dy == 0:
+                            continue
+                        painter.drawText(x + dx, baseline + dy, line)
+            painter.setPen(QPen(font_color))
+            painter.drawText(x, baseline, line)
+
+
 class SubtitleCreatorMainWindow(QMainWindow):
     _invoke_signal = Signal(object)
     def __init__(self):
@@ -155,7 +546,50 @@ class SubtitleCreatorMainWindow(QMainWindow):
         self.media_path = ""
         self.start_offset = max(0.0, self.config.start_offset)
         self._asr_start_time: float | None = None
+        self._global_overlay_style: dict[str, Any] = {
+            "font_family": self.config.overlay_font_family or DEFAULT_FONT_FAMILY,
+            "font_size": self.config.overlay_font_size or DEFAULT_FONT_SIZE,
+            "font_color": self.config.overlay_font_color or DEFAULT_FONT_COLOR,
+            "outline_enabled": (
+                self.config.overlay_outline_enabled
+                if self.config.overlay_outline_enabled is not None
+                else DEFAULT_OUTLINE_ENABLED
+            ),
+            "outline_thickness": (
+                self.config.overlay_outline_thickness
+                if self.config.overlay_outline_thickness is not None
+                else DEFAULT_OUTLINE_THICKNESS
+            ),
+            "outline_color": self.config.overlay_outline_color or DEFAULT_OUTLINE_COLOR,
+        }
+        self._active_cue_index: int | None = None
+        self._active_overlay_rect: QRect | None = None
+        self._subtitle_active = False
+        self._compositing_enabled = True
+        self._active_subtitle_text = ""
+        self._active_subtitle_style: dict[str, Any] = dict(self._global_overlay_style)
+        self._show_overlay_box = True
+        self._mute_preview = False
+        self._global_overlay_rect_default: dict[str, int] | None = None
+        self._global_overlay_rect_norm: dict[str, float] | None = self.config.overlay_rect_norm
+        self._coord_edit_blocked = False
+        self._dragging_overlay = False
+        self._drag_start_pos = None
+        self._drag_start_rect: QRect | None = None
+        self._drag_mode: str | None = None
         self._build_ui()
+        self._apply_font_controls(self._global_overlay_style)
+        self._apply_preview_option_controls()
+        self._global_overlay_rect_default = None
+        self._active_overlay_rect = None
+        self._coord_edit_blocked = True
+        self.overlay_coord_inputs["x1"].setText("0")
+        self.overlay_coord_inputs["y1"].setText("0")
+        self.overlay_coord_inputs["x2"].setText("0")
+        self.overlay_coord_inputs["y2"].setText("0")
+        self._coord_edit_blocked = False
+        self.overlay_position_label.setText(self._format_overlay_coords(None))
+        self.video_sink.videoFrameChanged.connect(self._on_video_frame_changed)
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -242,25 +676,102 @@ class SubtitleCreatorMainWindow(QMainWindow):
         layout.addLayout(controls)
 
         layout.addWidget(QLabel("미리보기"))
-        self.video_widget = QVideoWidget()
+        self.video_widget = VideoPreviewWidget()
         self.video_widget.setMinimumHeight(240)
         self.video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        layout.addWidget(self.video_widget, 2)
-        self.preview_overlay = QLabel(self.video_widget)
-        self.preview_overlay.setVisible(False)
-        self.preview_overlay.setWordWrap(True)
-        self.preview_overlay.setAlignment(Qt.AlignCenter | Qt.AlignBottom)
-        self.preview_overlay.setStyleSheet(
-            "color: white; background-color: rgba(0, 0, 0, 0.65); padding: 8px 12px; border-radius: 6px;"
+        self.video_container = QWidget()
+        container_layout = QVBoxLayout(self.video_container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.addWidget(self.video_widget)
+        self.video_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self.video_container, 2)
+        self.video_sink = QVideoSink(self)
+        self.video_widget.set_video_sink(self.video_sink)
+        self.video_widget.clicked.connect(self._on_preview_clicked)
+        self.video_widget.rectAdjusted.connect(self._on_subtitle_rect_adjusted)
+        preview_options_row = QHBoxLayout()
+        preview_options_row.setSpacing(12)
+        self.show_overlay_box_checkbox = QCheckBox("자막 영역 표시")
+        self.show_overlay_box_checkbox.setChecked(True)
+        self.show_overlay_box_checkbox.stateChanged.connect(self._on_preview_option_changed)
+        preview_options_row.addWidget(self.show_overlay_box_checkbox)
+        self.mute_preview_checkbox = QCheckBox("미리보기 음소거")
+        self.mute_preview_checkbox.setChecked(False)
+        self.mute_preview_checkbox.stateChanged.connect(self._on_preview_option_changed)
+        preview_options_row.addWidget(self.mute_preview_checkbox)
+        preview_options_row.addSpacerItem(QSpacerItem(1, 1, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        layout.addLayout(preview_options_row)
+        self.preview_border = QWidget(self.video_widget)
+        self.preview_border.setStyleSheet(
+            "border: 2px solid #00cc00; background-color: transparent;"
         )
-        self.preview_overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.video_widget.installEventFilter(self)
+        self.preview_border.hide()
+        self.preview_border.setCursor(Qt.OpenHandCursor)
+        self.preview_border.setMouseTracking(True)
+        self.preview_border.installEventFilter(self)
+        self.video_container.installEventFilter(self)
+        self.overlay_position_label = QLabel("오버레이 위치 (x1, y1) (x2, y2)")
+        self.overlay_position_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.overlay_position_label)
+        coord_layout = QHBoxLayout()
+        coord_layout.setSpacing(6)
+        self.overlay_coord_inputs: dict[str, QLineEdit] = {}
+        coord_layout.addWidget(QLabel("좌표"))
+        for key in ("x1", "y1", "x2", "y2"):
+            coord_layout.addWidget(QLabel(key))
+            edit = QLineEdit()
+            edit.setFixedWidth(70)
+            edit.setValidator(QIntValidator(0, 9999))
+            edit.editingFinished.connect(self._on_overlay_coord_changed)
+            coord_layout.addWidget(edit)
+            self.overlay_coord_inputs[key] = edit
+        layout.addLayout(coord_layout)
+        font_controls_layout = QHBoxLayout()
+        font_controls_layout.setSpacing(8)
+        font_controls_layout.addWidget(QLabel("폰트"))
+        self.font_combo = QFontComboBox()
+        self.font_combo.currentFontChanged.connect(self._on_font_control_changed)
+        font_controls_layout.addWidget(self.font_combo)
+        font_controls_layout.addWidget(QLabel("크기"))
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setRange(10, 200)
+        self.font_size_spin.valueChanged.connect(self._on_font_control_changed)
+        font_controls_layout.addWidget(self.font_size_spin)
+        font_controls_layout.addWidget(QLabel("글자 색"))
+        self.font_color_edit = QLineEdit(DEFAULT_FONT_COLOR)
+        self.font_color_edit.setFixedWidth(90)
+        self.font_color_edit.editingFinished.connect(self._on_font_control_changed)
+        font_controls_layout.addWidget(self.font_color_edit)
+        font_color_btn = QPushButton("선택")
+        font_color_btn.clicked.connect(
+            lambda: self._choose_color(self.font_color_edit, DEFAULT_FONT_COLOR)
+        )
+        font_controls_layout.addWidget(font_color_btn)
+        self.outline_checkbox = QCheckBox("외곽선")
+        self.outline_checkbox.stateChanged.connect(self._on_font_control_changed)
+        font_controls_layout.addWidget(self.outline_checkbox)
+        font_controls_layout.addWidget(QLabel("두께"))
+        self.outline_spin = QSpinBox()
+        self.outline_spin.setRange(0, 20)
+        self.outline_spin.valueChanged.connect(self._on_font_control_changed)
+        font_controls_layout.addWidget(self.outline_spin)
+        font_controls_layout.addWidget(QLabel("색"))
+        self.outline_color_edit = QLineEdit(DEFAULT_OUTLINE_COLOR)
+        self.outline_color_edit.setFixedWidth(90)
+        self.outline_color_edit.editingFinished.connect(self._on_font_control_changed)
+        font_controls_layout.addWidget(self.outline_color_edit)
+        outline_color_btn = QPushButton("선택")
+        outline_color_btn.clicked.connect(
+            lambda: self._choose_color(self.outline_color_edit, DEFAULT_OUTLINE_COLOR)
+        )
+        font_controls_layout.addWidget(outline_color_btn)
+        layout.addLayout(font_controls_layout)
         self.preview_status_label = QLabel("자막을 선택하면 영상과 음성이 재생됩니다.")
         layout.addWidget(self.preview_status_label)
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
         self.player.setAudioOutput(self.audio_output)
-        self.player.setVideoOutput(self.video_widget)
+        self.player.setVideoSink(self.video_sink)
         self.preview_timer = QTimer(self)
         self.preview_timer.setSingleShot(True)
         self.preview_timer.timeout.connect(self._pause_preview)
@@ -274,40 +785,554 @@ class SubtitleCreatorMainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
 
-    def _position_overlay(self) -> None:
-        if not self.preview_overlay.isVisible():
+    def _position_overlay(self) -> QRect | None:
+        if not self._subtitle_active:
+            self.preview_border.hide()
+            self.overlay_position_label.setText(self._format_overlay_coords(None))
+            return None
+        bounds = self._video_bounds()
+        if bounds is None:
+            self.preview_border.hide()
+            return None
+        rect = self._active_overlay_rect
+        if rect is None:
+            default = self._global_overlay_rect_default or self._initial_overlay_rect_dict()
+            rect = _dict_to_rect(default, bounds)
+            self._active_overlay_rect = rect
+        return self._set_overlay_rect(rect, update_inputs=True, persist=False)
+
+    def _set_overlay_rect(
+        self,
+        rect: QRect,
+        update_inputs: bool = True,
+        persist: bool = True,
+    ) -> QRect:
+        bounds = self._video_bounds()
+        if bounds is None:
+            self._active_overlay_rect = QRect(rect)
+            self.preview_border.hide()
+            self.overlay_position_label.setText(self._format_overlay_coords(None))
+            return QRect(rect)
+        rect = QRect(rect)
+        rect = self._clamp_rect_to_bounds(rect, bounds)
+        self._active_overlay_rect = rect
+        widget_rect = self.video_widget.map_video_rect_to_widget(rect)
+        if not self._show_overlay_box:
+            self.preview_border.hide()
+        elif widget_rect is None or widget_rect.isEmpty():
+            self.preview_border.hide()
+        else:
+            self.preview_border.setGeometry(widget_rect)
+            self.preview_border.show()
+            self.preview_border.raise_()
+        self.video_widget.set_subtitle(self._active_subtitle_text, self._active_subtitle_style, rect)
+        coords_text = self._format_overlay_coords(rect)
+        self.overlay_position_label.setText(coords_text)
+        if update_inputs and not self._coord_edit_blocked:
+            self._coord_edit_blocked = True
+            self._update_coord_inputs(rect)
+            self._coord_edit_blocked = False
+        if persist and self._active_cue_index is not None:
+            rect_dict = _rect_to_dict(rect)
+            self._apply_overlay_rect_to_following(rect_dict)
+        return rect
+
+    def _show_preview_overlay(self, cue: dict) -> None:
+        text = cue.get("text", "").strip()
+        if not text:
+            self._subtitle_active = False
+            self.video_widget.clear_subtitle()
+            self.preview_border.hide()
+            self.overlay_position_label.setText(self._format_overlay_coords(None))
             return
-        margin = 16
-        max_height = 120
-        parent_height = self.video_widget.height()
-        height = min(max_height, parent_height - margin * 2)
-        if height < 40:
-            height = parent_height - margin
-        self.preview_overlay.setGeometry(
-            margin,
-            max(margin, parent_height - height - margin),
-            max(100, self.video_widget.width() - margin * 2),
-            max(20, height),
+        style = self._cue_style(cue)
+        options = self._cue_options(cue)
+        self._subtitle_active = True
+        self._active_subtitle_text = text
+        self._active_subtitle_style = dict(style)
+        self._show_overlay_box = bool(options["show_overlay_box"])
+        self._mute_preview = bool(options["mute_preview"])
+        self._apply_preview_option_controls()
+        self.video_widget.enable_compositing(self._compositing_enabled)
+        bounds = self._video_bounds()
+        if bounds is None:
+            self.preview_border.hide()
+            return
+        self._ensure_cue_overlay_rect_video(cue)
+        rect_source = cue.get("overlay_rect") or self._global_overlay_rect_default
+        rect = _dict_to_rect(rect_source or self._initial_overlay_rect_dict(), bounds)
+        self._set_overlay_rect(rect, update_inputs=True)
+
+    def _video_bounds(self) -> QRect | None:
+        size = self.video_widget.video_size()
+        if size is None:
+            return None
+        width = int(getattr(size, "width", lambda: 0)())
+        height = int(getattr(size, "height", lambda: 0)())
+        if width <= 0 or height <= 0:
+            return None
+        return QRect(0, 0, width, height)
+
+    def _video_rect_to_norm(self, rect: QRect, bounds: QRect) -> dict[str, float]:
+        width = float(bounds.width()) if bounds.width() else 1.0
+        height = float(bounds.height()) if bounds.height() else 1.0
+        return {
+            "x": rect.x() / width,
+            "y": rect.y() / height,
+            "width": rect.width() / width,
+            "height": rect.height() / height,
+        }
+
+    def _norm_to_video_rect_dict(self, norm: dict[str, float], bounds: QRect) -> dict[str, int] | None:
+        try:
+            x = float(norm["x"])
+            y = float(norm["y"])
+            w = float(norm["width"])
+            h = float(norm["height"])
+        except Exception:
+            return None
+        x = max(0.0, min(1.0, x))
+        y = max(0.0, min(1.0, y))
+        w = max(0.01, min(1.0, w))
+        h = max(0.01, min(1.0, h))
+        rect = QRect(
+            int(round(x * bounds.width())),
+            int(round(y * bounds.height())),
+            int(round(w * bounds.width())),
+            int(round(h * bounds.height())),
         )
+        rect = self._clamp_rect_to_bounds(rect, bounds)
+        return _rect_to_dict(rect)
 
-    def _show_preview_overlay(self, text: str) -> None:
-        snippet = text.strip()
-        if not snippet:
-            self.preview_overlay.hide()
+    def _persist_overlay_style_to_config(self) -> None:
+        self.config.overlay_font_family = str(self._global_overlay_style.get("font_family") or DEFAULT_FONT_FAMILY)
+        self.config.overlay_font_size = int(self._global_overlay_style.get("font_size") or DEFAULT_FONT_SIZE)
+        self.config.overlay_font_color = str(self._global_overlay_style.get("font_color") or DEFAULT_FONT_COLOR)
+        self.config.overlay_outline_enabled = bool(self._global_overlay_style.get("outline_enabled", DEFAULT_OUTLINE_ENABLED))
+        self.config.overlay_outline_thickness = int(
+            self._global_overlay_style.get("outline_thickness") or DEFAULT_OUTLINE_THICKNESS
+        )
+        self.config.overlay_outline_color = str(self._global_overlay_style.get("outline_color") or DEFAULT_OUTLINE_COLOR)
+        save_config(self.config)
+
+    def _persist_overlay_rect_to_config(self, rect_video: QRect) -> None:
+        bounds = self._video_bounds()
+        if bounds is None:
             return
-        if len(snippet) > 120:
-            snippet = snippet[:120].rstrip() + "…"
-        self.preview_overlay.setText(snippet)
-        self.preview_overlay.setVisible(True)
-        self._position_overlay()
+        norm = self._video_rect_to_norm(rect_video, bounds)
+        for key in norm:
+            norm[key] = round(float(norm[key]), 6)
+        self.config.overlay_rect_norm = norm
+        self._global_overlay_rect_norm = dict(norm)
+        save_config(self.config)
 
-    def _hide_preview_overlay(self) -> None:
-        self.preview_overlay.hide()
+    def _apply_overlay_rect_to_following(self, rect_dict: dict[str, int]) -> None:
+        start_index = self._active_cue_index if self._active_cue_index is not None else 0
+        for cue in self.cues[start_index:]:
+            cue["overlay_rect"] = dict(rect_dict)
+            cue["overlay_space"] = "video"
+        self._global_overlay_rect_default = dict(rect_dict)
+
+    def _on_video_frame_changed(self, frame: QVideoFrame) -> None:
+        size = frame.size()
+        if size.isEmpty():
+            return
+        bounds = self._video_bounds()
+        if bounds is None:
+            return
+        if self._global_overlay_rect_default is None:
+            if self._global_overlay_rect_norm:
+                rect_dict = self._norm_to_video_rect_dict(self._global_overlay_rect_norm, bounds)
+                self._global_overlay_rect_default = rect_dict or self._initial_overlay_rect_dict()
+            else:
+                self._global_overlay_rect_default = self._initial_overlay_rect_dict()
+        if self._active_cue_index is not None and 0 <= self._active_cue_index < len(self.cues):
+            cue = self.cues[self._active_cue_index]
+            self._ensure_cue_overlay_rect_video(cue)
+            rect_source = cue.get("overlay_rect") or self._global_overlay_rect_default
+            rect = _dict_to_rect(rect_source or self._initial_overlay_rect_dict(), bounds)
+            self._set_overlay_rect(rect, update_inputs=True, persist=False)
+
+    def _ensure_cue_overlay_rect_video(self, cue: dict) -> None:
+        bounds = self._video_bounds()
+        if bounds is None:
+            return
+        rect_dict = cue.get("overlay_rect")
+        if not isinstance(rect_dict, dict):
+            cue["overlay_rect"] = dict(self._global_overlay_rect_default or self._initial_overlay_rect_dict())
+            cue["overlay_space"] = "video"
+            return
+        try:
+            rect = QRect(
+                int(rect_dict.get("x", 0)),
+                int(rect_dict.get("y", 0)),
+                int(rect_dict.get("width", 0)),
+                int(rect_dict.get("height", 0)),
+            )
+        except Exception:
+            cue["overlay_rect"] = dict(self._global_overlay_rect_default or self._initial_overlay_rect_dict())
+            cue["overlay_space"] = "video"
+            return
+        space = cue.get("overlay_space")
+        if space == "video":
+            cue["overlay_rect"] = _rect_to_dict(self._clamp_rect_to_bounds(rect, bounds))
+            return
+        widget_rect = QRect(rect)
+        converted = self.video_widget.map_widget_rect_to_video(widget_rect)
+        if converted is None:
+            cue["overlay_rect"] = dict(self._global_overlay_rect_default or self._initial_overlay_rect_dict())
+            cue["overlay_space"] = "video"
+            return
+        converted = self._clamp_rect_to_bounds(converted, bounds)
+        cue["overlay_rect"] = _rect_to_dict(converted)
+        cue["overlay_space"] = "video"
+
+    def _on_preview_clicked(self) -> None:
+        if not self._compositing_enabled:
+            self._compositing_enabled = True
+            self.video_widget.enable_compositing(True)
+        if self._subtitle_active and self._active_overlay_rect is not None:
+            self.video_widget.set_subtitle(
+                self._active_subtitle_text,
+                self._active_subtitle_style,
+                self._active_overlay_rect,
+            )
+
+    def _on_preview_option_changed(self, *_) -> None:
+        if self._active_cue_index is None:
+            self._show_overlay_box = bool(self.show_overlay_box_checkbox.isChecked())
+            self._mute_preview = bool(self.mute_preview_checkbox.isChecked())
+        else:
+            self._show_overlay_box = bool(self.show_overlay_box_checkbox.isChecked())
+            self._mute_preview = bool(self.mute_preview_checkbox.isChecked())
+            for cue in self.cues[self._active_cue_index:]:
+                cue["show_overlay_box"] = self._show_overlay_box
+                cue["mute_preview"] = self._mute_preview
+        self.audio_output.setMuted(bool(self._mute_preview))
+        if self._subtitle_active and self._active_overlay_rect is not None:
+            self._set_overlay_rect(self._active_overlay_rect, update_inputs=False, persist=False)
+
+    def _on_subtitle_rect_adjusted(self, rect: QRect) -> None:
+        if not self._subtitle_active:
+            return
+        if self._active_cue_index is None:
+            return
+        rect_video = self._set_overlay_rect(rect, update_inputs=True, persist=True)
+        self._persist_overlay_rect_to_config(rect_video)
+
+    def _clamp_rect_to_bounds(self, rect: QRect, bounds: QRect) -> QRect:
+        max_width = max(40, bounds.width())
+        max_height = max(30, bounds.height())
+        width = min(max(rect.width(), 20), max_width)
+        height = min(max(rect.height(), 20), max_height)
+        x = min(max(0, rect.x()), max(0, bounds.width() - width))
+        y = min(max(0, rect.y()), max(0, bounds.height() - height))
+        return QRect(x, y, width, height)
+
+    def _update_coord_inputs(self, rect: QRect) -> None:
+        self.overlay_coord_inputs["x1"].setText(str(rect.x()))
+        self.overlay_coord_inputs["y1"].setText(str(rect.y()))
+        self.overlay_coord_inputs["x2"].setText(str(rect.x() + rect.width()))
+        self.overlay_coord_inputs["y2"].setText(str(rect.y() + rect.height()))
+
+    def _rect_from_coord_inputs(self) -> QRect | None:
+        try:
+            x1 = int(self.overlay_coord_inputs["x1"].text())
+            y1 = int(self.overlay_coord_inputs["y1"].text())
+            x2 = int(self.overlay_coord_inputs["x2"].text())
+            y2 = int(self.overlay_coord_inputs["y2"].text())
+        except (ValueError, TypeError):
+            return None
+        width = max(20, x2 - x1)
+        height = max(20, y2 - y1)
+        return QRect(x1, y1, width, height)
+
+    def _on_overlay_coord_changed(self) -> None:
+        if self._coord_edit_blocked:
+            return
+        rect = self._rect_from_coord_inputs()
+        if rect is None:
+            return
+        rect_video = self._set_overlay_rect(rect, update_inputs=False, persist=True)
+        self._persist_overlay_rect_to_config(rect_video)
+
+    def _on_font_control_changed(self, *_) -> None:
+        style = self._style_from_controls()
+        self._global_overlay_style.update(style)
+        self._persist_overlay_style_to_config()
+        start_index = self._active_cue_index if self._active_cue_index is not None else 0
+        self._apply_style_to_cues(style, start_index)
+        if self._active_cue_index is not None:
+            self._show_preview_overlay(self.cues[self._active_cue_index])
+
+    def _format_overlay_coords(self, rect: QRect | None) -> str:
+        bounds = self._video_bounds()
+        suffix = ""
+        if bounds is not None:
+            suffix = f" / 영상 {bounds.width()}x{bounds.height()}"
+        if rect is None:
+            return f"오버레이 위치 (x1, y1) (x2, y2){suffix}"
+        x1, y1 = rect.x(), rect.y()
+        x2 = x1 + rect.width()
+        y2 = y1 + rect.height()
+        return f"오버레이 위치 ({x1}, {y1}) ({x2}, {y2}){suffix}"
+
+    def _cue_style(self, cue: dict) -> dict[str, Any]:
+        return {
+            "font_family": cue.get("font_family", self._global_overlay_style["font_family"]),
+            "font_size": cue.get("font_size", self._global_overlay_style["font_size"]),
+            "font_color": cue.get("font_color", self._global_overlay_style["font_color"]),
+            "outline_enabled": cue.get("outline_enabled", self._global_overlay_style["outline_enabled"]),
+            "outline_thickness": cue.get("outline_thickness", self._global_overlay_style["outline_thickness"]),
+            "outline_color": cue.get("outline_color", self._global_overlay_style["outline_color"]),
+        }
+
+    def _cue_options(self, cue: dict) -> dict[str, Any]:
+        return {
+            "show_overlay_box": cue.get("show_overlay_box", self._show_overlay_box),
+            "mute_preview": cue.get("mute_preview", self._mute_preview),
+        }
+
+    def _apply_preview_option_controls(self) -> None:
+        widgets = [self.show_overlay_box_checkbox, self.mute_preview_checkbox]
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            self.show_overlay_box_checkbox.setChecked(bool(self._show_overlay_box))
+            self.mute_preview_checkbox.setChecked(bool(self._mute_preview))
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+
+    def _overlay_meta_dict(self, rect: dict[str, int] | None = None) -> dict[str, Any]:
+        rect_source = rect or self._global_overlay_rect_default or self._initial_overlay_rect_dict()
+        overlay_rect = dict(rect_source)
+        overlay_space = "video" if self._video_bounds() is not None else "widget"
+        return {
+            "font_family": self._global_overlay_style["font_family"],
+            "font_size": self._global_overlay_style["font_size"],
+            "font_color": self._global_overlay_style["font_color"],
+            "outline_enabled": self._global_overlay_style["outline_enabled"],
+            "outline_thickness": self._global_overlay_style["outline_thickness"],
+            "outline_color": self._global_overlay_style["outline_color"],
+            "overlay_rect": overlay_rect,
+            "overlay_space": overlay_space,
+            "show_overlay_box": self._show_overlay_box,
+            "mute_preview": self._mute_preview,
+        }
+
+    def _cue_overlay_meta(self, cue: dict) -> dict[str, Any]:
+        rect_source = cue.get("overlay_rect") or self._global_overlay_rect_default or self._initial_overlay_rect_dict()
+        meta = self._cue_style(cue)
+        meta["overlay_rect"] = dict(rect_source)
+        meta["overlay_space"] = cue.get("overlay_space", "video")
+        meta["show_overlay_box"] = cue.get("show_overlay_box", self._show_overlay_box)
+        meta["mute_preview"] = cue.get("mute_preview", self._mute_preview)
+        return meta
+
+    def _style_from_controls(self) -> dict[str, Any]:
+        font_family = self.font_combo.currentFont().family()
+        font_size = self.font_size_spin.value()
+        font_color = self._normalize_color(self.font_color_edit.text(), DEFAULT_FONT_COLOR)
+        outline_enabled = bool(self.outline_checkbox.isChecked())
+        outline_thickness = self.outline_spin.value()
+        outline_color = self._normalize_color(self.outline_color_edit.text(), DEFAULT_OUTLINE_COLOR)
+        self._decorate_color_input(self.font_color_edit)
+        self._decorate_color_input(self.outline_color_edit)
+        return {
+            "font_family": font_family,
+            "font_size": font_size,
+            "font_color": font_color,
+            "outline_enabled": outline_enabled,
+            "outline_thickness": outline_thickness,
+            "outline_color": outline_color,
+        }
+
+    def _apply_font_controls(self, style: dict[str, Any]) -> None:
+        widgets = [
+            self.font_combo,
+            self.font_size_spin,
+            self.font_color_edit,
+            self.outline_checkbox,
+            self.outline_spin,
+            self.outline_color_edit,
+        ]
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            self.font_combo.setCurrentFont(QFont(style["font_family"]))
+            self.font_size_spin.setValue(style["font_size"])
+            self.font_color_edit.setText(style["font_color"])
+            self._decorate_color_input(self.font_color_edit)
+            self.outline_checkbox.setChecked(bool(style["outline_enabled"]))
+            self.outline_spin.setValue(style["outline_thickness"])
+            self.outline_color_edit.setText(style["outline_color"])
+            self._decorate_color_input(self.outline_color_edit)
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+
+    def _apply_style_to_cues(self, style: dict[str, Any], start_index: int) -> None:
+        for cue in self.cues[start_index:]:
+            cue.update(style)
+
+    def _choose_color(self, target: QLineEdit, fallback: str) -> None:
+        current = QColor(target.text())
+        if not current.isValid():
+            current = QColor(fallback)
+        color = QColorDialog.getColor(current, self, "색상 선택")
+        if not color.isValid():
+            return
+        target.setText(color.name())
+        self._decorate_color_input(target)
+        self._on_font_control_changed()
+
+    def _decorate_color_input(self, edit: QLineEdit) -> None:
+        color = QColor(edit.text())
+        if not color.isValid():
+            color = QColor(DEFAULT_FONT_COLOR)
+        text_color = "#000000" if color.lightnessF() > 0.5 else "#ffffff"
+        edit.setStyleSheet(f"background-color: {color.name()}; color: {text_color};")
+
+    def _normalize_color(self, value: str, fallback: str) -> str:
+        color = QColor(value)
+        return color.name() if color.isValid() else fallback
+
+    def _initial_overlay_rect_dict(self) -> dict[str, int]:
+        bounds = self._video_bounds()
+        if bounds is None:
+            x = DEFAULT_OVERLAY_MARGIN
+            y = DEFAULT_OVERLAY_MARGIN
+            width = 640
+            height = DEFAULT_OVERLAY_HEIGHT
+            return {"x": x, "y": y, "width": width, "height": height}
+        width = max(40, bounds.width() - DEFAULT_OVERLAY_MARGIN * 2)
+        height = min(DEFAULT_OVERLAY_HEIGHT, max(30, bounds.height() - DEFAULT_OVERLAY_MARGIN * 2))
+        x = DEFAULT_OVERLAY_MARGIN
+        y = max(0, bounds.height() - height - DEFAULT_OVERLAY_MARGIN)
+        return {"x": x, "y": y, "width": width, "height": height}
 
     def eventFilter(self, obj, event) -> bool:
-        if obj is self.video_widget and event.type() == QEvent.Resize:
+        if obj is self.video_container and event.type() == QEvent.Resize:
             self._position_overlay()
+        if obj is self.preview_border:
+            if event.type() == QEvent.MouseMove and not self._dragging_overlay:
+                self._update_preview_border_cursor(self._event_position(event))
+                return False
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._dragging_overlay = True
+                self._drag_mode = self._overlay_drag_mode(self._event_position(event))
+                self._drag_start_pos = self.preview_border.mapToParent(self._event_position(event))
+                self._drag_start_rect = QRect(self.preview_border.geometry())
+                self.preview_border.setCursor(Qt.ClosedHandCursor)
+                return True
+            if event.type() == QEvent.MouseMove and self._dragging_overlay:
+                pos = self.preview_border.mapToParent(self._event_position(event))
+                delta = pos - self._drag_start_pos
+                widget_rect = self._apply_drag_delta(QRect(self._drag_start_rect), delta)
+                video_rect = self.video_widget.map_widget_rect_to_video(widget_rect)
+                if video_rect is not None:
+                    self._set_overlay_rect(video_rect, update_inputs=True, persist=False)
+                return True
+            if event.type() == QEvent.MouseButtonRelease and self._dragging_overlay:
+                self._dragging_overlay = False
+                self._drag_mode = None
+                self.preview_border.setCursor(Qt.OpenHandCursor)
+                if self._active_overlay_rect is not None:
+                    self._apply_overlay_rect_to_following(_rect_to_dict(self._active_overlay_rect))
+                    self._persist_overlay_rect_to_config(self._active_overlay_rect)
+                return True
         return super().eventFilter(obj, event)
+
+    def _overlay_drag_mode(self, pos) -> str:
+        handle = 8
+        w = self.preview_border.width()
+        h = self.preview_border.height()
+        near_left = pos.x() <= handle
+        near_right = pos.x() >= w - handle
+        near_top = pos.y() <= handle
+        near_bottom = pos.y() >= h - handle
+        if near_left and near_top:
+            return "resize_tl"
+        if near_right and near_top:
+            return "resize_tr"
+        if near_left and near_bottom:
+            return "resize_bl"
+        if near_right and near_bottom:
+            return "resize_br"
+        if near_left:
+            return "resize_l"
+        if near_right:
+            return "resize_r"
+        if near_top:
+            return "resize_t"
+        if near_bottom:
+            return "resize_b"
+        return "move"
+
+    def _update_preview_border_cursor(self, pos) -> None:
+        mode = self._overlay_drag_mode(pos)
+        if mode in {"resize_tl", "resize_br"}:
+            self.preview_border.setCursor(Qt.SizeFDiagCursor)
+        elif mode in {"resize_tr", "resize_bl"}:
+            self.preview_border.setCursor(Qt.SizeBDiagCursor)
+        elif mode in {"resize_l", "resize_r"}:
+            self.preview_border.setCursor(Qt.SizeHorCursor)
+        elif mode in {"resize_t", "resize_b"}:
+            self.preview_border.setCursor(Qt.SizeVerCursor)
+        else:
+            self.preview_border.setCursor(Qt.OpenHandCursor)
+
+    def _apply_drag_delta(self, rect: QRect, delta) -> QRect:
+        target = self.video_widget.video_target_rect()
+        if target.isEmpty():
+            target = self.video_widget.rect()
+        min_w = 40
+        min_h = 30
+        mode = self._drag_mode or "move"
+        if mode == "move":
+            rect.translate(delta)
+            rect.moveLeft(min(max(rect.left(), target.left()), target.right() - rect.width()))
+            rect.moveTop(min(max(rect.top(), target.top()), target.bottom() - rect.height()))
+            return rect
+
+        if "l" in mode:
+            rect.setLeft(rect.left() + delta.x())
+        if "r" in mode:
+            rect.setRight(rect.right() + delta.x())
+        if "t" in mode:
+            rect.setTop(rect.top() + delta.y())
+        if "b" in mode:
+            rect.setBottom(rect.bottom() + delta.y())
+        rect = rect.normalized()
+
+        if rect.width() < min_w:
+            if "l" in mode:
+                rect.setLeft(rect.right() - min_w)
+            else:
+                rect.setRight(rect.left() + min_w)
+        if rect.height() < min_h:
+            if "t" in mode:
+                rect.setTop(rect.bottom() - min_h)
+            else:
+                rect.setBottom(rect.top() + min_h)
+
+        rect.setLeft(max(rect.left(), target.left()))
+        rect.setTop(max(rect.top(), target.top()))
+        rect.setRight(min(rect.right(), target.right()))
+        rect.setBottom(min(rect.bottom(), target.bottom()))
+
+        if rect.width() < min_w:
+            rect.setRight(min(target.right(), rect.left() + min_w))
+        if rect.height() < min_h:
+            rect.setBottom(min(target.bottom(), rect.top() + min_h))
+
+        return rect
+
+    def _event_position(self, event):
+        if hasattr(event, "position"):
+            return event.position().toPoint()
+        return event.pos()
 
     def _log(self, message: str) -> None:
         self.log_view.append(message)
@@ -377,7 +1402,13 @@ class SubtitleCreatorMainWindow(QMainWindow):
         if start_seconds is None or end_seconds is None or not text:
             self.status_bar.showMessage("시간 또는 텍스트가 유효하지 않습니다.", 3000)
             return
-        cue_entry = build_cue_entry(start_seconds, end_seconds, text, offset=self.start_offset)
+        cue_entry = build_cue_entry(
+            start_seconds,
+            end_seconds,
+            text,
+            offset=self.start_offset,
+            overlay_meta=self._overlay_meta_dict(),
+        )
         self.cues.append(cue_entry)
         self._refresh_cue_table()
         self._refresh_preview()
@@ -417,7 +1448,9 @@ class SubtitleCreatorMainWindow(QMainWindow):
     def _on_cue_selected(self, row: int, column: int) -> None:
         if not (0 <= row < len(self.cues)):
             return
+        self._active_cue_index = row
         cue = self.cues[row]
+        self._apply_font_controls(self._cue_style(cue))
         self.status_bar.showMessage(
             f"{cue['start_label']} - {cue['end_label']} ({cue['duration_label']}): {cue['text']}",
             3000,
@@ -435,22 +1468,21 @@ class SubtitleCreatorMainWindow(QMainWindow):
         if self.player.source() != target_url:
             self.player.setSource(target_url)
         self._stop_preview()
+        self.audio_output.setMuted(bool(self._cue_options(cue)["mute_preview"]))
         position_ms = int(cue["source_start"] * 1000)
         duration_ms = max(100, int((cue["source_end"] - cue["source_start"]) * 1000))
         self.player.setPosition(position_ms)
         self.player.play()
         self.preview_timer.start(duration_ms + 200)
-        self._show_preview_overlay(cue["text"])
+        self._show_preview_overlay(cue)
 
     def _pause_preview(self) -> None:
         self.player.pause()
         self.preview_status_label.setText("재생이 완료되었습니다.")
-        self._hide_preview_overlay()
 
     def _stop_preview(self) -> None:
         self.preview_timer.stop()
         self.player.pause()
-        self._hide_preview_overlay()
 
     def _offset_changed(self) -> None:
         text = self.offset_edit.text().strip()
@@ -479,6 +1511,7 @@ class SubtitleCreatorMainWindow(QMainWindow):
                 cue["source_end"],
                 cue["text"],
                 offset=self.start_offset,
+                overlay_meta=self._cue_overlay_meta(cue),
             )
             for cue in previous_cues
         ]
@@ -538,7 +1571,13 @@ class SubtitleCreatorMainWindow(QMainWindow):
     def _reflow_cues(self) -> None:
         max_chars = self.config.subtitle_char_length
         self.cues = [
-            build_cue_entry(cue["start"], cue["end"], cue["text"], offset=self.start_offset)
+            build_cue_entry(
+                cue["start"],
+                cue["end"],
+                cue["text"],
+                offset=self.start_offset,
+                overlay_meta=self._overlay_meta_dict(),
+            )
             for cue in split_segments(self.raw_segments, max_chars)
         ]
         self._refresh_cue_table()
@@ -563,6 +1602,7 @@ def main() -> None:
     window = SubtitleCreatorMainWindow()
     window.show()
     sys.exit(app.exec())
+
 
 
 if __name__ == "__main__":
