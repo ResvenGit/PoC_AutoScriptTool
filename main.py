@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import logging
+import json
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import warnings
@@ -424,31 +428,128 @@ class VideoPreviewWidget(QWidget):
                 space_width = metrics.horizontalAdvance(" ")
                 token_widths = [metrics.horizontalAdvance(token) for token in tokens]
                 if any(width > max_width for width in token_widths):
-                    lines.extend(self._wrap_by_chars(paragraph, metrics, max_width))
+                    lines.extend(self._wrap_by_chars_balanced(paragraph, font, metrics, max_width))
                     continue
-                breaks = self._optimal_breaks(token_widths, space_width, max_width)
+                token_chars = [len(token) for token in tokens]
+                line_count = self._min_line_count(token_widths, space_width, max_width)
+                if line_count <= 1:
+                    lines.append(" ".join(tokens))
+                    continue
+                breaks = self._optimal_breaks_fixed_lines(
+                    token_widths,
+                    token_chars,
+                    space_width,
+                    max_width,
+                    line_count,
+                )
+                if breaks is None:
+                    lines.extend(self._wrap_by_chars_balanced(paragraph, font, metrics, max_width))
+                    continue
                 idx = 0
                 for next_idx in breaks:
                     lines.append(" ".join(tokens[idx:next_idx]))
                     idx = next_idx
                 continue
 
-            lines.extend(self._wrap_by_chars(paragraph, metrics, max_width))
+            lines.extend(self._wrap_by_chars_balanced(paragraph, font, metrics, max_width))
 
         self._wrap_cache_key = cache_key
         self._wrap_cache_lines = lines
         return lines
 
-    def _wrap_by_chars(self, text: str, metrics: QFontMetrics, max_width: int) -> list[str]:
+    def _wrap_by_chars_balanced(self, text: str, font: QFont, metrics: QFontMetrics, max_width: int) -> list[str]:
         chars = list(text)
         char_widths = [metrics.horizontalAdvance(ch) for ch in chars]
-        breaks = self._optimal_breaks(char_widths, 0, max_width)
+        line_count = self._min_line_count(char_widths, 0, max_width)
+        if line_count <= 1:
+            return [text]
+        breaks = self._optimal_breaks_fixed_lines(
+            char_widths,
+            [1] * len(chars),
+            0,
+            max_width,
+            line_count,
+        )
+        if breaks is None:
+            breaks = self._optimal_breaks(char_widths, 0, max_width)
         lines: list[str] = []
         idx = 0
         for next_idx in breaks:
             lines.append("".join(chars[idx:next_idx]))
             idx = next_idx
         return lines
+
+    def _min_line_count(self, token_widths: list[int], space_width: int, max_width: int) -> int:
+        if not token_widths:
+            return 1
+        if any(width > max_width for width in token_widths):
+            return max(1, len(token_widths))
+        lines = 1
+        line_w = 0
+        for width in token_widths:
+            candidate = width if line_w == 0 else line_w + space_width + width
+            if line_w and candidate > max_width:
+                lines += 1
+                line_w = width
+            else:
+                line_w = candidate
+        return max(1, lines)
+
+    def _optimal_breaks_fixed_lines(
+        self,
+        token_widths: list[int],
+        token_chars: list[int],
+        space_width: int,
+        max_width: int,
+        line_count: int,
+    ) -> list[int] | None:
+        n = len(token_widths)
+        if n == 0:
+            return []
+        line_count = max(1, int(line_count))
+        avg_chars = (sum(token_chars) / line_count) if line_count else float(sum(token_chars))
+        inf = 10**18
+        dp: list[list[float]] = [[float(inf)] * (line_count + 1) for _ in range(n + 1)]
+        nxt: list[list[int]] = [[0] * (line_count + 1) for _ in range(n + 1)]
+        dp[n][0] = 0.0
+        for i in range(n - 1, -1, -1):
+            for l in range(1, line_count + 1):
+                line_w = 0
+                line_chars = 0
+                for j in range(i, n):
+                    if j == i:
+                        line_w = token_widths[j]
+                    else:
+                        line_w += space_width + token_widths[j]
+                    if line_w > max_width and j > i:
+                        break
+                    if line_w > max_width and j == i:
+                        continue
+                    line_chars += token_chars[j]
+                    remainder = dp[j + 1][l - 1]
+                    if remainder >= float(inf):
+                        continue
+                    diff = line_chars - avg_chars
+                    cost = diff * diff
+                    candidate = cost + remainder
+                    if candidate < dp[i][l]:
+                        dp[i][l] = candidate
+                        nxt[i][l] = j + 1
+        if dp[0][line_count] >= float(inf):
+            return None
+        breaks: list[int] = []
+        idx = 0
+        remaining = line_count
+        while idx < n and remaining > 0:
+            next_idx = nxt[idx][remaining]
+            if next_idx <= idx:
+                next_idx = min(n, idx + 1)
+            breaks.append(next_idx)
+            idx = next_idx
+            remaining -= 1
+        if idx < n:
+            breaks.append(n)
+        return breaks
 
     def _optimal_breaks(self, token_widths: list[int], space_width: int, max_width: int) -> list[int]:
         n = len(token_widths)
@@ -546,6 +647,7 @@ class SubtitleCreatorMainWindow(QMainWindow):
         self.media_path = ""
         self.start_offset = max(0.0, self.config.start_offset)
         self._asr_start_time: float | None = None
+        self._video_bounds_hint: QRect | None = None
         self._global_overlay_style: dict[str, Any] = {
             "font_family": self.config.overlay_font_family or DEFAULT_FONT_FAMILY,
             "font_size": self.config.overlay_font_size or DEFAULT_FONT_SIZE,
@@ -577,6 +679,8 @@ class SubtitleCreatorMainWindow(QMainWindow):
         self._drag_start_pos = None
         self._drag_start_rect: QRect | None = None
         self._drag_mode: str | None = None
+        self._pending_overlay_rect_apply = False
+        self._continuous_preview = False
         self._build_ui()
         self._apply_font_controls(self._global_overlay_style)
         self._apply_preview_option_controls()
@@ -699,6 +803,13 @@ class SubtitleCreatorMainWindow(QMainWindow):
         self.mute_preview_checkbox.setChecked(False)
         self.mute_preview_checkbox.stateChanged.connect(self._on_preview_option_changed)
         preview_options_row.addWidget(self.mute_preview_checkbox)
+        self.continuous_preview_checkbox = QCheckBox("미리보기 연속 재생")
+        self.continuous_preview_checkbox.setChecked(False)
+        self.continuous_preview_checkbox.stateChanged.connect(self._on_continuous_preview_changed)
+        preview_options_row.addWidget(self.continuous_preview_checkbox)
+        self.stop_preview_button = QPushButton("미리보기 멈춤")
+        self.stop_preview_button.clicked.connect(self._on_stop_preview_clicked)
+        preview_options_row.addWidget(self.stop_preview_button)
         preview_options_row.addSpacerItem(QSpacerItem(1, 1, QSizePolicy.Expanding, QSizePolicy.Minimum))
         layout.addLayout(preview_options_row)
         self.preview_border = QWidget(self.video_widget)
@@ -780,6 +891,13 @@ class SubtitleCreatorMainWindow(QMainWindow):
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         layout.addWidget(self.log_view, 1)
+
+        export_row = QHBoxLayout()
+        export_row.addSpacerItem(QSpacerItem(1, 1, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        self.export_btn = QPushButton("영상 Export")
+        self.export_btn.clicked.connect(self._export_video)
+        export_row.addWidget(self.export_btn)
+        layout.addLayout(export_row)
 
         self.setCentralWidget(root)
         self.status_bar = QStatusBar()
@@ -866,7 +984,7 @@ class SubtitleCreatorMainWindow(QMainWindow):
     def _video_bounds(self) -> QRect | None:
         size = self.video_widget.video_size()
         if size is None:
-            return None
+            return QRect(self._video_bounds_hint) if self._video_bounds_hint is not None else None
         width = int(getattr(size, "width", lambda: 0)())
         height = int(getattr(size, "height", lambda: 0)())
         if width <= 0 or height <= 0:
@@ -919,6 +1037,15 @@ class SubtitleCreatorMainWindow(QMainWindow):
         bounds = self._video_bounds()
         if bounds is None:
             return
+        if rect_video.isNull() or rect_video.width() <= 0 or rect_video.height() <= 0:
+            return
+        if (
+            rect_video.x() == 0
+            and rect_video.y() == 0
+            and rect_video.width() == 0
+            and rect_video.height() == 0
+        ):
+            return
         norm = self._video_rect_to_norm(rect_video, bounds)
         for key in norm:
             norm[key] = round(float(norm[key]), 6)
@@ -946,6 +1073,12 @@ class SubtitleCreatorMainWindow(QMainWindow):
                 self._global_overlay_rect_default = rect_dict or self._initial_overlay_rect_dict()
             else:
                 self._global_overlay_rect_default = self._initial_overlay_rect_dict()
+        if self._pending_overlay_rect_apply and self._active_cue_index is None:
+            rect_dict = self._global_overlay_rect_default or self._initial_overlay_rect_dict()
+            rect = _dict_to_rect(rect_dict, bounds)
+            self._active_overlay_rect = rect
+            self._set_overlay_rect(rect, update_inputs=True, persist=False)
+            self._pending_overlay_rect_apply = False
         if self._active_cue_index is not None and 0 <= self._active_cue_index < len(self.cues):
             cue = self.cues[self._active_cue_index]
             self._ensure_cue_overlay_rect_video(cue)
@@ -1011,6 +1144,13 @@ class SubtitleCreatorMainWindow(QMainWindow):
         self.audio_output.setMuted(bool(self._mute_preview))
         if self._subtitle_active and self._active_overlay_rect is not None:
             self._set_overlay_rect(self._active_overlay_rect, update_inputs=False, persist=False)
+
+    def _on_continuous_preview_changed(self, *_) -> None:
+        self._continuous_preview = bool(self.continuous_preview_checkbox.isChecked())
+
+    def _on_stop_preview_clicked(self) -> None:
+        self._stop_preview()
+        self.preview_status_label.setText("미리보기 멈춤")
 
     def _on_subtitle_rect_adjusted(self, rect: QRect) -> None:
         if not self._subtitle_active:
@@ -1356,12 +1496,369 @@ class SubtitleCreatorMainWindow(QMainWindow):
         self.config.last_media_dir = str(Path(path).parent)
         save_config(self.config)
         self.media_path = path
+        self._video_bounds_hint = None
+        self._global_overlay_rect_default = None
+        self._active_overlay_rect = None
+        self._pending_overlay_rect_apply = True
+        try:
+            _, ffprobe = self._find_ffmpeg_tools()
+            if ffprobe:
+                info = self._probe_media(path, ffprobe)
+                width = int(info.get("width") or 0)
+                height = int(info.get("height") or 0)
+                if width > 0 and height > 0:
+                    self._video_bounds_hint = QRect(0, 0, width, height)
+        except Exception:
+            self._video_bounds_hint = None
         self.video_path_edit.setText(path)
         self.player.setSource(QUrl.fromLocalFile(path))
+        self._restore_overlay_rect_from_config_if_needed()
         self._log(f"영상 선택됨: {Path(path).name}")
         self._set_progress(5, "ASR 준비 중...")
         self._asr_start_time = time.perf_counter()
         threading.Thread(target=partial(self._run_asr, path), daemon=True).start()
+
+    def _restore_overlay_rect_from_config_if_needed(self) -> None:
+        bounds = self._video_bounds()
+        if bounds is None:
+            return
+        if self._global_overlay_rect_default is None:
+            if self._global_overlay_rect_norm:
+                rect_dict = self._norm_to_video_rect_dict(self._global_overlay_rect_norm, bounds)
+                self._global_overlay_rect_default = rect_dict or self._initial_overlay_rect_dict()
+            else:
+                self._global_overlay_rect_default = self._initial_overlay_rect_dict()
+        if self._active_cue_index is not None:
+            return
+        try:
+            current = {k: int(self.overlay_coord_inputs[k].text()) for k in ("x1", "y1", "x2", "y2")}
+            all_zero = all(v == 0 for v in current.values())
+        except Exception:
+            all_zero = True
+        if not all_zero and self._active_overlay_rect is not None:
+            return
+        rect_dict = self._global_overlay_rect_default or self._initial_overlay_rect_dict()
+        rect = _dict_to_rect(rect_dict, bounds)
+        self._active_overlay_rect = rect
+        self._set_overlay_rect(rect, update_inputs=True, persist=False)
+
+    def _find_ffmpeg_tools(self) -> tuple[str | None, str | None]:
+        ffmpeg = shutil.which("ffmpeg")
+        ffprobe = shutil.which("ffprobe")
+        return ffmpeg, ffprobe
+
+    def _probe_media(self, path: str, ffprobe_path: str) -> dict[str, Any]:
+        cmd = [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,width,height:format=duration",
+            "-of",
+            "json",
+            path,
+        ]
+        output = subprocess.check_output(cmd, text=True, encoding="utf-8", errors="replace")
+        data = json.loads(output or "{}")
+        streams = data.get("streams") or []
+        stream = streams[0] if streams else {}
+        fmt = data.get("format") or {}
+        duration = 0.0
+        try:
+            duration = float(fmt.get("duration") or 0.0)
+        except Exception:
+            duration = 0.0
+        return {
+            "codec_name": str(stream.get("codec_name") or ""),
+            "width": int(stream.get("width") or 0),
+            "height": int(stream.get("height") or 0),
+            "duration": duration,
+        }
+
+    def _build_scripted_output_path(self, input_path: str) -> str:
+        src = Path(input_path)
+        base = src.with_name(f"{src.stem}_Scripted{src.suffix}")
+        if not base.exists():
+            return str(base)
+        for idx in range(2, 1000):
+            candidate = src.with_name(f"{src.stem}_Scripted_{idx}{src.suffix}")
+            if not candidate.exists():
+                return str(candidate)
+        return str(base)
+
+    def _ffmpeg_filter_escape_path(self, path: str) -> str:
+        value = Path(path).resolve().as_posix()
+        value = value.replace(":", "\\:")
+        value = value.replace("'", "\\'")
+        return value
+
+    def _ass_time(self, seconds: float) -> str:
+        total_cs = max(0, int(round(seconds * 100.0)))
+        hours, remainder = divmod(total_cs, 360000)
+        minutes, remainder = divmod(remainder, 6000)
+        secs, cs = divmod(remainder, 100)
+        return f"{hours}:{minutes:02d}:{secs:02d}.{cs:02d}"
+
+    def _ass_color(self, value: str, fallback: str = "&H00FFFFFF") -> str:
+        text = (value or "").strip()
+        if text.startswith("#") and len(text) == 7:
+            try:
+                r = int(text[1:3], 16)
+                g = int(text[3:5], 16)
+                b = int(text[5:7], 16)
+                return f"&H00{b:02X}{g:02X}{r:02X}"
+            except Exception:
+                return fallback
+        return fallback
+
+    def _ass_escape_text(self, value: str) -> str:
+        text = (value or "").replace("\r", "").strip()
+        text = text.replace("\\", "\\\\")
+        text = text.replace("{", "\\{").replace("}", "\\}")
+        return text
+
+    def _build_ass_script(self, bounds: QRect) -> str:
+        styles: dict[tuple, str] = {}
+        style_lines: list[str] = []
+        dialogue_lines: list[str] = []
+        padding = 8
+
+        def style_name_for(style: dict[str, Any]) -> str:
+            key = (
+                style.get("font_family") or DEFAULT_FONT_FAMILY,
+                int(style.get("font_size") or DEFAULT_FONT_SIZE),
+                str(style.get("font_color") or DEFAULT_FONT_COLOR),
+                bool(style.get("outline_enabled", DEFAULT_OUTLINE_ENABLED)),
+                int(style.get("outline_thickness") or DEFAULT_OUTLINE_THICKNESS),
+                str(style.get("outline_color") or DEFAULT_OUTLINE_COLOR),
+            )
+            if key in styles:
+                return styles[key]
+            name = f"S{len(styles) + 1}"
+            styles[key] = name
+            font_family, font_size, font_color, outline_enabled, outline_thickness, outline_color = key
+            outline = outline_thickness if outline_enabled else 0
+            style_lines.append(
+                "Style: "
+                f"{name},{font_family},{font_size},"
+                f"{self._ass_color(font_color)},&H00000000,{self._ass_color(outline_color,'&H00000000')},&H00000000,"
+                "0,0,0,0,100,100,0,0,1,"
+                f"{outline},0,2,0,0,0,1"
+            )
+            return name
+
+        for cue in self.cues:
+            text = (cue.get("text") or "").strip()
+            if not text:
+                continue
+            start = float(cue.get("source_start") or 0.0)
+            end = float(cue.get("source_end") or start)
+            if end <= start:
+                continue
+            style = self._cue_style(cue)
+            rect_dict = cue.get("overlay_rect") or self._global_overlay_rect_default or self._initial_overlay_rect_dict()
+            rect = _dict_to_rect(rect_dict, bounds)
+
+            font_family = style.get("font_family") or DEFAULT_FONT_FAMILY
+            font_size = int(style.get("font_size") or DEFAULT_FONT_SIZE)
+            font = QFont(font_family, max(1, max(8, font_size)))
+            metrics = QFontMetrics(font)
+
+            y2 = rect.y() + rect.height()
+            text_rect = rect.adjusted(padding, padding, -padding, -padding)
+            max_width = max(20, text_rect.width())
+            lines = self.video_widget._wrap_lines_balanced(text, font, metrics, max_width)
+            needed_height = len(lines) * metrics.lineSpacing() + padding * 2
+            if needed_height > rect.height():
+                new_y1 = max(0, y2 - needed_height)
+                rect = QRect(rect.x(), new_y1, rect.width(), y2 - new_y1).intersected(bounds)
+                text_rect = rect.adjusted(padding, padding, -padding, -padding)
+
+            clip_x1 = int(text_rect.x())
+            clip_y1 = int(text_rect.y())
+            clip_x2 = int(text_rect.x() + text_rect.width())
+            clip_y2 = int(text_rect.y() + text_rect.height())
+            pos_x = int(round(text_rect.x() + text_rect.width() / 2))
+            pos_y = int(round(rect.y() + rect.height() - padding))
+
+            ass_text = "\\N".join(self._ass_escape_text(line) for line in lines)
+            override = f"{{\\an2\\pos({pos_x},{pos_y})\\clip({clip_x1},{clip_y1},{clip_x2},{clip_y2})}}"
+            style_name = style_name_for(style)
+            dialogue_lines.append(
+                f"Dialogue: 0,{self._ass_time(start)},{self._ass_time(end)},{style_name},,0,0,0,,{override}{ass_text}"
+            )
+
+        script_info = "\n".join(
+            [
+                "[Script Info]",
+                "ScriptType: v4.00+",
+                f"PlayResX: {bounds.width()}",
+                f"PlayResY: {bounds.height()}",
+                "WrapStyle: 2",
+                "ScaledBorderAndShadow: yes",
+                "",
+                "[V4+ Styles]",
+                "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,"
+                "Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
+                "Alignment,MarginL,MarginR,MarginV,Encoding",
+            ]
+        )
+        events_header = "\n".join(
+            [
+                "",
+                "[Events]",
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+            ]
+        )
+        return "\n".join([script_info, *style_lines, events_header, *dialogue_lines, ""])
+
+    def _select_video_encoder(self, codec_name: str) -> str:
+        name = (codec_name or "").lower()
+        if name in {"hevc", "h265"}:
+            return "libx265"
+        if name in {"vp9"}:
+            return "libvpx-vp9"
+        if name in {"vp8"}:
+            return "libvpx"
+        return "libx264"
+
+    def _export_video(self) -> None:
+        if not self.media_path:
+            self._log("?ìƒ??? íƒ?˜ì? ?Šì•˜?µë‹ˆ??")
+            return
+        if not self.cues:
+            self._log("?ë§‰ ëª©ë¡?? ?ŠìŠµ?ˆë‹¤.")
+            return
+        ffmpeg, ffprobe = self._find_ffmpeg_tools()
+        if not ffmpeg or not ffprobe:
+            self._log("ffmpeg/ffprobeë¥? ì°¾ì? ìˆ˜ ?ŠìŠµ?ˆë‹¤. PATHë¥? í™œì¸?´ì£¼ì„¸??")
+            return
+        try:
+            info = self._probe_media(self.media_path, ffprobe)
+        except Exception as exc:
+            self._log(f"ffprobe ?¤íŒ¨: {exc}")
+            return
+        bounds = self._video_bounds()
+        if bounds is None:
+            width = int(info.get("width") or 0)
+            height = int(info.get("height") or 0)
+            if width <= 0 or height <= 0:
+                self._log("??ìƒ í¬ê¸°ë¥? ì•Œ ìˆ˜ ?Šì–´ Exportë¥? ? í–‰? í•  ìˆ˜ ?ŠìŠµ?ˆë‹¤.")
+                return
+            bounds = QRect(0, 0, width, height)
+        ass_text = self._build_ass_script(bounds)
+        ass_file = tempfile.NamedTemporaryFile(delete=False, suffix=".ass", mode="w", encoding="utf-8")
+        ass_path = ass_file.name
+        try:
+            ass_file.write(ass_text)
+            ass_file.close()
+        except Exception:
+            try:
+                ass_file.close()
+            except Exception:
+                pass
+            raise
+        output_path = self._build_scripted_output_path(self.media_path)
+        duration = float(info.get("duration") or 0.0)
+        encoder = self._select_video_encoder(str(info.get("codec_name") or ""))
+        self.export_btn.setEnabled(False)
+        self._set_progress(0, "Export ì¤€ë¹? ì¤‘...")
+        threading.Thread(
+            target=self._run_export,
+            args=(ffmpeg, ass_path, output_path, duration, encoder),
+            daemon=True,
+        ).start()
+
+    def _run_export(
+        self,
+        ffmpeg_path: str,
+        ass_path: str,
+        output_path: str,
+        duration_seconds: float,
+        encoder: str,
+    ) -> None:
+        try:
+            escaped_ass = self._ffmpeg_filter_escape_path(ass_path)
+            filter_arg = f"subtitles=filename='{escaped_ass}':charenc=UTF-8"
+            cmd = [
+                ffmpeg_path,
+                "-y",
+                "-hide_banner",
+                "-nostats",
+                "-i",
+                self.media_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-vf",
+                filter_arg,
+                "-c:v",
+                encoder,
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+                "-c:a",
+                "copy",
+                "-progress",
+                "pipe:1",
+                output_path,
+            ]
+            self._schedule_ui(lambda: self._set_progress(0, "Export ì§„í–‰ ì¤‘..."))
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+            last_out_time_ms: int | None = None
+            last_line = ""
+            if proc.stdout is not None:
+                for raw in proc.stdout:
+                    line = (raw or "").strip()
+                    if line:
+                        last_line = line
+                    if "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    if key == "out_time_ms":
+                        try:
+                            last_out_time_ms = int(value)
+                        except Exception:
+                            last_out_time_ms = None
+                    if duration_seconds > 0 and last_out_time_ms is not None:
+                        percent = int(
+                            max(
+                                0.0,
+                                min(
+                                    99.0,
+                                    (last_out_time_ms / 1_000_000.0) / duration_seconds * 100.0,
+                                ),
+                            )
+                        )
+                        self._schedule_ui(lambda p=percent: self._set_progress(p, "Export ì§„í–‰ ì¤‘..."))
+            rc = proc.wait()
+            if rc == 0:
+                self._schedule_ui(lambda: self._set_progress(100, "Export ?„ë£Œ"))
+                self._schedule_ui(lambda: self._log(f"Export ?„ë£Œ: {Path(output_path).name}"))
+            else:
+                self._schedule_ui(lambda: self._set_progress(0, "Export ?¤íŒ¨"))
+                self._schedule_ui(lambda: self._log(f"Export ?¤íŒ¨ (code={rc}): {last_line}"))
+        except Exception as exc:
+            self._schedule_ui(lambda exc=exc: self._log(f"Export ?¤íŒ¨: {exc}"))
+            self._schedule_ui(lambda: self._set_progress(0, "Export ?¤íŒ¨"))
+        finally:
+            try:
+                Path(ass_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._schedule_ui(lambda: self.export_btn.setEnabled(True))
 
     def _run_asr(self, path: str) -> None:
         self._schedule_ui(lambda: self._set_progress(15, "ASR 실행 중..."))
@@ -1379,6 +1876,7 @@ class SubtitleCreatorMainWindow(QMainWindow):
     def _refresh_from_asr(self) -> None:
         self._set_progress(80, "자막을 재구성 중입니다...")
         self._reflow_cues()
+        self._restore_overlay_rect_from_config_if_needed()
         self._set_progress(100, "ASR 완료, 자막 목록이 갱신되었습니다.")
         self._log("ASR 완료, 자막 목록이 갱신되었습니다.")
         if self._asr_start_time is not None:
@@ -1448,6 +1946,8 @@ class SubtitleCreatorMainWindow(QMainWindow):
     def _on_cue_selected(self, row: int, column: int) -> None:
         if not (0 <= row < len(self.cues)):
             return
+        if row == self._active_cue_index and self._is_preview_playing():
+            return
         self._active_cue_index = row
         cue = self.cues[row]
         self._apply_font_controls(self._cue_style(cue))
@@ -1457,6 +1957,34 @@ class SubtitleCreatorMainWindow(QMainWindow):
         )
         self.preview_status_label.setText(
             f"재생 중: {cue['start_label']} - {cue['end_label']} ({cue['text'][:40]}...)"
+        )
+        self._play_cue_preview(cue)
+
+    def _is_preview_playing(self) -> bool:
+        if not self.preview_timer.isActive():
+            return False
+        try:
+            return self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        except Exception:
+            try:
+                return self.player.state() == QMediaPlayer.PlayingState
+            except Exception:
+                return True
+
+    def _play_cue_preview_by_index(self, row: int) -> None:
+        if not (0 <= row < len(self.cues)):
+            return
+        cue = self.cues[row]
+        self._active_cue_index = row
+        try:
+            self.cue_table.blockSignals(True)
+            self.cue_table.selectRow(row)
+            self.cue_table.setCurrentCell(row, 0)
+        finally:
+            self.cue_table.blockSignals(False)
+        self._apply_font_controls(self._cue_style(cue))
+        self.preview_status_label.setText(
+            f"재생 중 {cue['start_label']} - {cue['end_label']} ({cue['text'][:40]}...)"
         )
         self._play_cue_preview(cue)
 
@@ -1478,6 +2006,11 @@ class SubtitleCreatorMainWindow(QMainWindow):
 
     def _pause_preview(self) -> None:
         self.player.pause()
+        if self._continuous_preview and self._active_cue_index is not None:
+            next_row = self._active_cue_index + 1
+            if next_row < len(self.cues):
+                self._play_cue_preview_by_index(next_row)
+                return
         self.preview_status_label.setText("재생이 완료되었습니다.")
 
     def _stop_preview(self) -> None:

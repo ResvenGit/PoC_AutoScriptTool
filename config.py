@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -87,6 +88,17 @@ def load_config() -> SubtitleConfig:
                     result[key] = float(raw)
                 except (TypeError, ValueError):
                     return None
+                if not math.isfinite(result[key]):
+                    return None
+            if result["width"] <= 0 or result["height"] <= 0:
+                return None
+            if (
+                result["x"] == 0.0
+                and result["y"] == 0.0
+                and result["width"] == 0.0
+                and result["height"] == 0.0
+            ):
+                return None
             return result
 
         return SubtitleConfig(
