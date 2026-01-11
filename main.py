@@ -21,7 +21,6 @@ warnings.filterwarnings(
 
 from PySide6.QtGui import (
     QColor,
-    QDoubleValidator,
     QFont,
     QFontMetrics,
     QIntValidator,
@@ -156,6 +155,14 @@ def split_segments(
             current_chunk.append(word)
         if current_chunk:
             chunks.append(current_chunk.copy())
+
+        min_chunk_len = max_chars / 3.0
+        while len(chunks) >= 2:
+            last_text = " ".join(word["text"] for word in chunks[-1]).strip()
+            if len(last_text) >= min_chunk_len:
+                break
+            chunks[-2].extend(chunks[-1])
+            chunks.pop()
 
         for chunk in chunks:
             chunk_text = " ".join(word["text"] for word in chunk)
@@ -719,16 +726,6 @@ class SubtitleCreatorMainWindow(QMainWindow):
         length_row.addWidget(self.char_length_edit)
         layout.addLayout(length_row)
 
-        offset_row = QHBoxLayout()
-        self.offset_edit = QLineEdit(f"{self.start_offset:.3f}")
-        offset_validator = QDoubleValidator(0.0, 3600.0, 3)
-        offset_validator.setNotation(QDoubleValidator.StandardNotation)
-        self.offset_edit.setValidator(offset_validator)
-        self.offset_edit.editingFinished.connect(self._offset_changed)
-        offset_row.addWidget(QLabel("시작 오프셋 (초)"))
-        offset_row.addWidget(self.offset_edit)
-        layout.addLayout(offset_row)
-
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -827,15 +824,26 @@ class SubtitleCreatorMainWindow(QMainWindow):
         coord_layout = QHBoxLayout()
         coord_layout.setSpacing(6)
         self.overlay_coord_inputs: dict[str, QLineEdit] = {}
-        coord_layout.addWidget(QLabel("좌표"))
+        coord_label = QLabel("좌표")
+        coord_label.setFixedWidth(40)
+        coord_layout.addWidget(coord_label)
         for key in ("x1", "y1", "x2", "y2"):
-            coord_layout.addWidget(QLabel(key))
+            group = QWidget()
+            group_layout = QHBoxLayout(group)
+            group_layout.setContentsMargins(0, 0, 0, 0)
+            group_layout.setSpacing(4)
+            key_label = QLabel(key)
+            key_label.setFixedWidth(22)
+            key_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            group_layout.addWidget(key_label)
             edit = QLineEdit()
-            edit.setFixedWidth(70)
+            edit.setFixedWidth(80)
             edit.setValidator(QIntValidator(0, 9999))
             edit.editingFinished.connect(self._on_overlay_coord_changed)
-            coord_layout.addWidget(edit)
+            group_layout.addWidget(edit)
+            coord_layout.addWidget(group)
             self.overlay_coord_inputs[key] = edit
+        coord_layout.addSpacerItem(QSpacerItem(1, 1, QSizePolicy.Expanding, QSizePolicy.Minimum))
         layout.addLayout(coord_layout)
         font_controls_layout = QHBoxLayout()
         font_controls_layout.setSpacing(8)
@@ -1619,16 +1627,26 @@ class SubtitleCreatorMainWindow(QMainWindow):
         text = text.replace("{", "\\{").replace("}", "\\}")
         return text
 
+    def _ass_font_size_from_qt(self, font_family: str, point_size: int) -> int:
+        qt_font = QFont(font_family, max(1, max(8, int(point_size))))
+        metrics = QFontMetrics(qt_font)
+        size = int(round(metrics.ascent() + metrics.descent()))
+        return max(1, size)
+
     def _build_ass_script(self, bounds: QRect) -> str:
         styles: dict[tuple, str] = {}
         style_lines: list[str] = []
         dialogue_lines: list[str] = []
         padding = 8
-
         def style_name_for(style: dict[str, Any]) -> str:
+            font_size_base = int(style.get("font_size") or DEFAULT_FONT_SIZE)
+            font_size_ass = self._ass_font_size_from_qt(
+                style.get("font_family") or DEFAULT_FONT_FAMILY,
+                font_size_base,
+            )
             key = (
                 style.get("font_family") or DEFAULT_FONT_FAMILY,
-                int(style.get("font_size") or DEFAULT_FONT_SIZE),
+                font_size_ass,
                 str(style.get("font_color") or DEFAULT_FONT_COLOR),
                 bool(style.get("outline_enabled", DEFAULT_OUTLINE_ENABLED)),
                 int(style.get("outline_thickness") or DEFAULT_OUTLINE_THICKNESS),
@@ -1662,8 +1680,10 @@ class SubtitleCreatorMainWindow(QMainWindow):
             rect = _dict_to_rect(rect_dict, bounds)
 
             font_family = style.get("font_family") or DEFAULT_FONT_FAMILY
-            font_size = int(style.get("font_size") or DEFAULT_FONT_SIZE)
-            font = QFont(font_family, max(1, max(8, font_size)))
+            font_size_base = int(style.get("font_size") or DEFAULT_FONT_SIZE)
+            font_size_ass = self._ass_font_size_from_qt(font_family, font_size_base)
+            font = QFont(font_family)
+            font.setPixelSize(font_size_ass)
             metrics = QFontMetrics(font)
 
             y2 = rect.y() + rect.height()
@@ -2018,6 +2038,8 @@ class SubtitleCreatorMainWindow(QMainWindow):
         self.player.pause()
 
     def _offset_changed(self) -> None:
+        if not hasattr(self, "offset_edit") or self.offset_edit is None:
+            return
         text = self.offset_edit.text().strip()
         try:
             value = float(text) if text else 0.0
