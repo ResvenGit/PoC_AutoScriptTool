@@ -88,6 +88,7 @@ def build_cue_entry(
     text: str,
     offset: float = 0.0,
     overlay_meta: dict[str, Any] | None = None,
+    words: list[dict[str, Any]] | None = None,
 ) -> dict:
     """Creates a cue entry storing both source timing and adjusted labels."""
     source_start = max(0.0, source_start)
@@ -105,6 +106,7 @@ def build_cue_entry(
         "duration_label": format_time_name(duration),
         "text": text,
         "char_count": len(text),
+        "words": list(words) if words else [],
     }
     if overlay_meta:
         overlay_updates = {
@@ -135,7 +137,7 @@ def split_segments(
         start = float(segment.get("start", word_list[0]["start"]))
         end = float(segment.get("end", word_list[-1]["end"]))
         if len(segment_text) <= max_chars:
-            split_result.append({"start": start, "end": end, "text": segment_text})
+            split_result.append({"start": start, "end": end, "text": segment_text, "words": word_list})
             continue
         chunks: List[List[dict]] = []
         current_chunk: List[dict] = []
@@ -168,7 +170,7 @@ def split_segments(
             chunk_text = " ".join(word["text"] for word in chunk)
             chunk_start = float(chunk[0]["start"])
             chunk_end = float(chunk[-1]["end"])
-            split_result.append({"start": chunk_start, "end": chunk_end, "text": chunk_text})
+            split_result.append({"start": chunk_start, "end": chunk_end, "text": chunk_text, "words": chunk})
     return split_result
 
 
@@ -769,10 +771,17 @@ class SubtitleCreatorMainWindow(QMainWindow):
         layout.addWidget(self.cue_table, 1)
 
         controls = QHBoxLayout()
+        self.shift_word_prev_btn = QPushButton("한단어 앞으로 보내기")
+        self.shift_word_prev_btn.clicked.connect(self._shift_first_word_to_prev)
+        controls.addWidget(self.shift_word_prev_btn)
+        self.shift_word_next_btn = QPushButton("한단어 뒤로 보내기")
+        self.shift_word_next_btn.clicked.connect(self._shift_last_word_to_next)
+        controls.addWidget(self.shift_word_next_btn)
+        controls.addSpacerItem(QSpacerItem(1, 1, QSizePolicy.Expanding, QSizePolicy.Minimum))
         self.remove_btn = QPushButton("선택 삭제")
+        self.remove_btn.setFixedWidth(90)
         self.remove_btn.clicked.connect(self._remove_selected)
         self.remove_btn.setEnabled(False)
-        controls.addSpacerItem(QSpacerItem(1, 1))
         controls.addWidget(self.remove_btn)
         layout.addLayout(controls)
 
@@ -1926,6 +1935,7 @@ class SubtitleCreatorMainWindow(QMainWindow):
             text,
             offset=self.start_offset,
             overlay_meta=self._overlay_meta_dict(),
+            words=[],
         )
         self.cues.append(cue_entry)
         self._refresh_cue_table()
@@ -2067,6 +2077,7 @@ class SubtitleCreatorMainWindow(QMainWindow):
                 cue["text"],
                 offset=self.start_offset,
                 overlay_meta=self._cue_overlay_meta(cue),
+                words=cue.get("words") or [],
             )
             for cue in previous_cues
         ]
@@ -2107,6 +2118,88 @@ class SubtitleCreatorMainWindow(QMainWindow):
         self.remove_btn.setEnabled(bool(self.cues))
         self._log("선택된 자막을 삭제했습니다.")
 
+    def _update_cue_from_words(self, cue: dict) -> None:
+        words = cue.get("words") or []
+        if not words:
+            cue["text"] = ""
+            cue["char_count"] = 0
+            cue["source_end"] = cue.get("source_start", 0.0)
+        else:
+            cue["text"] = " ".join(str(w.get("text") or "").strip() for w in words).strip()
+            cue["char_count"] = len(cue["text"])
+            try:
+                cue["source_start"] = float(words[0].get("start", cue.get("source_start", 0.0)))
+                cue["source_end"] = float(words[-1].get("end", cue.get("source_end", cue["source_start"])))
+            except Exception:
+                pass
+
+        adjusted_start = max(0.0, float(cue.get("source_start", 0.0)) - float(self.start_offset))
+        adjusted_end = max(adjusted_start, float(cue.get("source_end", adjusted_start)) - float(self.start_offset))
+        duration = max(0.0, adjusted_end - adjusted_start)
+        cue["start_seconds"] = adjusted_start
+        cue["end_seconds"] = adjusted_end
+        cue["start_label"] = format_time_name(adjusted_start)
+        cue["end_label"] = format_time_name(adjusted_end)
+        cue["duration_label"] = format_time_name(duration)
+
+    def _shift_first_word_to_prev(self) -> None:
+        idx = self._active_cue_index
+        if idx is None or idx <= 0 or idx >= len(self.cues):
+            self._log("앞 자막이 없어서 이동할 수 없습니다.")
+            return
+        current = self.cues[idx]
+        prev = self.cues[idx - 1]
+        current_words = current.get("words") or []
+        prev_words = prev.get("words") or []
+        if not current_words:
+            self._log("현재 자막에 단어 정보가 없어 이동할 수 없습니다(ASR로 생성된 자막에서만 동작).")
+            return
+        word = current_words.pop(0)
+        prev_words.append(word)
+        prev["words"] = prev_words
+        current["words"] = current_words
+        self._update_cue_from_words(prev)
+        if current_words:
+            self._update_cue_from_words(current)
+        else:
+            self.cues.pop(idx)
+            idx = idx - 1
+        self._refresh_cue_table()
+        self._refresh_preview()
+        self.remove_btn.setEnabled(bool(self.cues))
+        self.cue_table.selectRow(idx)
+        self._active_cue_index = idx
+        self._log("첫 단어를 앞 자막으로 이동했습니다.")
+
+    def _shift_last_word_to_next(self) -> None:
+        idx = self._active_cue_index
+        if idx is None or idx < 0 or idx >= len(self.cues) - 1:
+            self._log("뒤 자막이 없어서 이동할 수 없습니다.")
+            return
+        current = self.cues[idx]
+        nxt = self.cues[idx + 1]
+        current_words = current.get("words") or []
+        next_words = nxt.get("words") or []
+        if not current_words:
+            self._log("현재 자막에 단어 정보가 없어 이동할 수 없습니다(ASR로 생성된 자막에서만 동작).")
+            return
+        word = current_words.pop()
+        next_words.insert(0, word)
+        nxt["words"] = next_words
+        current["words"] = current_words
+        self._update_cue_from_words(nxt)
+        if current_words:
+            self._update_cue_from_words(current)
+        else:
+            self.cues.pop(idx)
+        self._refresh_cue_table()
+        self._refresh_preview()
+        self.remove_btn.setEnabled(bool(self.cues))
+        new_idx = min(idx, len(self.cues) - 1)
+        self.cue_table.selectRow(new_idx)
+        self._active_cue_index = new_idx
+        self._log("마지막 단어를 뒤 자막으로 이동했습니다.")
+
     def _char_length_changed(self) -> None:
         text = self.char_length_edit.text().strip()
         try:
@@ -2132,6 +2225,7 @@ class SubtitleCreatorMainWindow(QMainWindow):
                 cue["text"],
                 offset=self.start_offset,
                 overlay_meta=self._overlay_meta_dict(),
+                words=cue.get("words") or [],
             )
             for cue in split_segments(self.raw_segments, max_chars)
         ]
